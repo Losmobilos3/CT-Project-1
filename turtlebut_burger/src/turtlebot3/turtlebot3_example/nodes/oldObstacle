@@ -1,0 +1,140 @@
+#!/usr/bin/env python
+#################################################################################
+# Copyright 2018 ROBOTIS CO., LTD.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#################################################################################
+
+# Authors: Gilbert #
+
+#import readFromLightSensor as LS
+import rospy
+import math
+from sensor_msgs.msg import LaserScan
+from geometry_msgs.msg import Twist
+
+LINEAR_VEL = 0.05
+STOP_DISTANCE = 0.2
+LIDAR_ERROR = 0.05
+SAFE_STOP_DISTANCE = STOP_DISTANCE + LIDAR_ERROR
+
+# Removes the data which is 0.0
+def remove_faults(scan_filter, samples_view):
+        for i in range(samples_view/3):
+            if scan_filter[i] == float('Inf'):
+                scan_filter[i] = 3.5
+            elif scan_filter[i] == 0:  # Make 0 measurements 3.5
+                scan_filter[i] = 3.5
+            elif math.isnan(scan_filter[i]):
+                scan_filter[i] = 3.5
+        return scan_filter
+
+class Obstacle():
+    def __init__(self):
+        self._cmd_pub = rospy.Publisher('cmd_vel', Twist, queue_size=1)
+        self.obstacle()
+
+    def get_scan(self):
+        scan = rospy.wait_for_message('scan', LaserScan)
+        scan_filter_right = [] # Defines arrays that stores the measurements for each of the 3 cones 
+	scan_filter_front = [] #
+	scan_filter_left = []  #
+       
+        samples = len(scan.ranges)  # The number of samples is defined in 
+                                    # turtlebot3_<model>.gazebo.xacro file,
+                                    # the default is 360.
+        samples_view = 180          # 1 <= samples_view <= samples
+        
+        if samples_view > samples:
+            samples_view = samples
+
+        if samples_view is 1:
+            scan_filter_front.append(scan.ranges[0])
+
+        else:
+            left_lidar_samples_ranges = -(samples_view//2 + samples_view % 2)
+            right_lidar_samples_ranges = samples_view//2
+            
+
+	    # Partitions the the 180 Degree cone in front of it, into a left and a right
+            left_lidar_samples = scan.ranges[left_lidar_samples_ranges:]
+            right_lidar_samples = scan.ranges[:right_lidar_samples_ranges]
+
+	    # Partitions the halves into thirds instead
+	    # We now have 3 cones instead, a left, front and a right
+	    scan_filter_right.extend(left_lidar_samples[:(2*samples_view/6)])
+	    scan_filter_front.extend(left_lidar_samples[(2*samples_view/6):] + right_lidar_samples[:(samples_view/6)])
+	    scan_filter_left.extend(right_lidar_samples[(samples_view/6):])
+
+	    # Removes the 0.0 values from the measurements
+            scan_filter_left = remove_faults(scan_filter_left, samples_view)
+	    scan_filter_front = remove_faults(scan_filter_front, samples_view)
+            scan_filter_right = remove_faults(scan_filter_right, samples_view)
+
+        return scan_filter_left, scan_filter_front, scan_filter_right
+
+    def obstacle(self):
+        twist = Twist()
+        turtlebot_moving = True
+	count = 0
+	turtlebot_reversing = False
+	turtlebot_turning = False
+
+        while not rospy.is_shutdown():
+            left_distances, front_distances, right_distances = self.get_scan()
+            min_left = min(left_distances)   # Finds the minimum value in each of the cones
+	    min_front = min(front_distances) #
+	    min_right = min(right_distances) #
+	    rospy.loginfo('Left, Front, Right : %f, %f, %f', min_left, min_front, min_right)
+	    #r, g, b = LS.getAndUpdateColour() # Gets data from the RGB sensor. 
+
+            if min_front < SAFE_STOP_DISTANCE or turtlebot_reversing:
+		turtlebot_moving = True
+		turtlebot_reversing = True
+	        twist.linear.x = -LINEAR_VEL
+                twist.angular.z = 0.0
+                self._cmd_pub.publish(twist)
+
+		if min_front > 2 * SAFE_STOP_DISTANCE:
+                    turtlebot_reversing = False
+		    turtlebot_turning = True
+
+	    elif turtlebot_turning:
+                if count % 2 == 1:
+		    twist.linear.x = 0.0
+                    twist.angular.z = 5.0
+		    self._cmd_pub.publish(twist)
+		else:
+		    twist.linear.x = 0.0
+                    twist.angular.z = -5.0
+		    self._cmd_pub.publish(twist)
+		turtlebot_turning = False
+		count += 1
+
+            else:
+                twist.linear.x = LINEAR_VEL
+                twist.angular.z = 0.0
+                self._cmd_pub.publish(twist)
+                turtlebot_moving = True
+                rospy.loginfo('Distance of the obstacle : %f', min_front)
+
+def main():
+    rospy.init_node('turtlebot3_obstacle')
+    try:
+        print("going!")
+	obstacle = Obstacle()
+    except rospy.ROSInterruptException:
+        pass
+
+if __name__ == '__main__':
+    main()

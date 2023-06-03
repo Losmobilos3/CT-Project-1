@@ -1,0 +1,284 @@
+#!/usr/bin/env python
+#################################################################################
+# Copyright 2018 ROBOTIS CO., LTD.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#################################################################################
+
+# Authors: Gilbert #
+
+import readFromLightSensor as LS
+import time
+import sys
+import rospy
+import math
+from sensor_msgs.msg import LaserScan
+from geometry_msgs.msg import Twist
+import numpy as np
+
+LINEAR_VEL = 0.05
+STOP_DISTANCE = 0.2
+LIDAR_ERROR = 0.05
+SAFE_STOP_DISTANCE = STOP_DISTANCE + LIDAR_ERROR
+MAX_LIN_VEL = 0.22
+MAX_ANG_VEL = 2.84
+cooldown = 1
+
+# Removes the data which is 0.0
+def remove_faults(scan_filter, samples_view):
+        for i in range(len(scan_filter)): #range(samples_view/6):
+            if scan_filter[i] == float('Inf'):
+                scan_filter[i] = 3.5
+            elif scan_filter[i] == 0:  # Make 0 measurements 3.5
+                scan_filter[i] = 3.5
+            elif math.isnan(scan_filter[i]):
+                scan_filter[i] = 3.5
+        return scan_filter
+
+class Obstacle():
+    def __init__(self):
+        self._cmd_pub = rospy.Publisher('cmd_vel', Twist, queue_size=1)
+        self.obstacle()
+
+    def get_scan(self):
+        scan = rospy.wait_for_message('scan', LaserScan)
+        scan_filter_right = [] # Defines arrays that stores the measurements for each of the 3 cones 
+	scan_filter_right_diag = [] #
+	scan_filter_front = [] #
+	scan_filter_left_diag = [] #
+	scan_filter_left = []  #
+
+        samples = len(scan.ranges)  # The number of samples is defined in 
+                                    # turtlebot3_<model>.gazebo.xacro file,
+                                    # the default is 360.
+        samples_view = 180          # 1 <= samples_view <= samples
+        
+        if samples_view > samples:
+            samples_view = samples
+
+        if samples_view is 1:
+            scan_filter_front.append(scan.ranges[0])
+
+        else:
+            left_lidar_samples_ranges = -(samples_view//2 + samples_view % 2)
+            right_lidar_samples_ranges = samples_view//2
+            
+
+	    # Partitions the the 180 Degree cone in front of it, into a left and a right
+            left_lidar_samples = scan.ranges[left_lidar_samples_ranges:]
+            right_lidar_samples = scan.ranges[:right_lidar_samples_ranges]
+
+	    # Partitions the halves into thirds instead
+	    # We now have 3 cones instead, a left, front and a right
+	    scan_filter_right.extend(left_lidar_samples[:(1*samples_view/6)]) # 30 degrees
+	    scan_filter_right_diag.extend(left_lidar_samples[(9*samples_view/36):(13*samples_view/36)]) # 20 degrees
+	    scan_filter_front.extend(left_lidar_samples[(8*samples_view/18):] + right_lidar_samples[:(1*samples_view/18)]) # 20 degrees
+	    scan_filter_left_diag.extend(right_lidar_samples[(3*samples_view/36):(7*samples_view/36)]) # 20 degrees
+	    scan_filter_left.extend(right_lidar_samples[(2*samples_view/6):]) # 30 degrees
+
+	    # Removes the 0.0 values from the measurements
+            scan_filter_left = remove_faults(scan_filter_left, samples_view)
+	    scan_filter_front = remove_faults(scan_filter_front, samples_view)
+            scan_filter_right = remove_faults(scan_filter_right, samples_view)
+	    scan_filter_right_diag = remove_faults(scan_filter_right_diag, samples_view)
+	    scan_filter_left_diag = remove_faults(scan_filter_left_diag, samples_view)
+	    scan_all = list(scan.ranges[:])
+	    scan_all = remove_faults(scan_all, samples_view)
+
+        return scan_filter_left, scan_filter_front, scan_filter_right, scan_filter_left_diag, scan_filter_right_diag, scan_all
+
+    def obstacle(self):
+        twist = Twist()
+        turtlebot_moving = True
+	turtlebot_reversing = False
+	turtlebot_turning = False
+	turtlebot_surrounded = False
+	turtlebot_wall = False
+	collision = False
+	coll_count = 0
+	turning_right = False
+	turning_left = False
+	cooldown_right = 0
+	cooldown_left = 0
+	cooldown_corner = 0
+
+	# Speed average variables
+	avg_lin_spd = 0
+	clock_count = 0
+	spd_accu = 0
+
+	#Victim counter
+	Victim_count = 0
+	victim = False
+
+        while not rospy.is_shutdown():
+	    	# Lidar data
+	    	left_distances, front_distances, right_distances, left_diag_distances, right_diag_distances,  all_distances = self.get_scan()
+
+		min_left = min(left_distances)   # Finds the minimum value in each of the cones
+		min_front = min(front_distances) #
+		min_right = min(right_distances) #
+		min_left_diag = min(left_diag_distances) #
+		min_right_diag = min(right_diag_distances) #
+
+		min_dist = min(all_distances) # Determines the absolute smallest distance
+		rospy.loginfo('Left, Left_diag, Front, Right_diag, Right : %f, %f, %f, %f, %f', min_left, min_left_diag, min_front, min_right_diag, min_right)
+		#rospy.loginfo('Left, Left_diag, Front, Right_diag, Right : %f, %f, %f, %f, %f', len(left_distances), len(left_diag_distances), len(front_distances), len(right_diag_distances), len(right_distances))
+		r, g, b = LS.getAndUpdateColour() # Gets data from the RGB sensor.
+		r, g = float(r), float(g)
+		print(r/g)
+		# If red_val larger than green_val
+
+		if victim:
+			if r/g <= 0.85:
+				victim = False
+			print("Victims found: " + str(Victim_count))
+
+		elif r/g >= 1.2:
+			victim = True
+			Victim_count += 1
+
+		if collision and min_dist > 0.20:
+			collision = False
+
+		elif (min_dist < 0.09125 or min_right_diag < 0.094 or min_left_diag < 0.094) and not collision:
+			collision = True
+			coll_count += 1
+			print("Collided")
+			print("Collision count = " + str(coll_count))
+
+	    	print(time.time() - starttime)
+
+		if time.time() - starttime > 120:
+			twist.angular.z = 0
+			twist.linear.x = 0
+			self._cmd_pub.publish(twist)
+			print("DONE!")
+			print("Collision count: " + str(coll_count))
+			print("Average linear speed: " + str(avg_lin_spd))
+			print("Victims found: " + str(Victim_count))
+			sys.exit()
+
+		if turtlebot_surrounded:
+			if min_front > SAFE_STOP_DISTANCE + 0.05:
+				turtlebot_surrounded = False
+			twist.angular.z = MAX_ANG_VEL / 3
+			twist.linear.x = 0
+
+        	elif min_front < 0.20 and min_left + min_right < 0.50:
+			turtlebot_surrounded = True
+
+		elif turtlebot_wall:
+			if turtlebot_reversing:
+				twist.linear.x = -MAX_LIN_VEL
+				twist.angular.z = 0
+				self._cmd_pub.publish(twist)
+				time.sleep(0.8)
+				turtlebot_reversing = False
+				if min_right > min_left:
+                                	turning_left = True
+				else:
+					turning_left = False
+			if min_front > SAFE_STOP_DISTANCE:
+				turtlebot_wall = False
+			if turning_left:
+				twist.angular.z = MAX_ANG_VEL / 3
+			else:
+				twist.angular.z = -MAX_ANG_VEL / 3
+			twist.linear.x = 0
+
+		elif min_front < 0.14 or min_right_diag < 0.135 or min_left_diag < 0.135: # or min_left_diag < 0.11 or min_right_diag < 0.11:
+			turtlebot_wall = True
+			turtlebot_reversing = True
+
+
+		elif turtlebot_turning:
+			if min_front > 0.4: #min_left_diag > 0.35 or min_right_diag > 0.35:
+				turtlebot_turning = False
+				#if min_left < 0.14 or min_right < 0.14:
+				#	if twist.angular.z > 0:
+				#		twist.angular.z = -MAX_ANG_VEL
+				#	else:
+				#		twist.angular.z = MAX_ANG_VEL
+				#self._cmd_pub.publish(twist)
+				#time.sleep(0.05)
+
+			elif min_right > min_left: #min_right > min_left:
+				twist.angular.z = -1 * MAX_ANG_VEL/(np.sqrt(min_front) * 10 - 2) #+ MAX_ANG_VEL * 0.2
+			elif min_left > min_right: #min_right < min_left:
+				twist.angular.z = 1 * MAX_ANG_VEL/(np.sqrt(min_front) * 10 - 2) #- MAX_ANG_VEL * 0.2
+			twist.linear.x = 0.55 * (1.0 * MAX_LIN_VEL * (min_front / 0.40)) #+ 0.1 * MAX_LIN_VEL)
+			print("Drejer")
+
+		elif min_front < 0.4:
+			turtlebot_turning = True
+			print("Jeg drejer nu!")
+
+		else:
+			twist.linear.x = MAX_LIN_VEL
+			twist.angular.z = 0
+
+			#if min_left_diag < 0.25 and min_right > 0.30 and time.time() - cooldown_corner > 2:
+                        #        twist.angular.z = -MAX_ANG_VEL * 3/4
+			#	cooldown_corner = time.time()
+
+                        #if min_right_diag < 0.25 and min_left > 0.30 and time.time() - cooldown_corner > 2:
+                        #        twist.angular.z = MAX_ANG_VEL * 3/4
+			#	cooldown_corner = time.time()
+
+			if min_right < 0.30:
+				if time.time() - cooldown_left > cooldown and min_right < 0.15:
+					twist.angular.z = MAX_ANG_VEL / 2
+					cooldown_left = time.time()
+				elif time.time() - cooldown_right > cooldown and min_right > 0.20:
+					twist.angular.z = -MAX_ANG_VEL / 2
+					cooldown_right = time.time()
+			elif min_left < 0.30:
+				if time.time() - cooldown_left > cooldown and min_left < 0.15:
+					twist.angular.z = -MAX_ANG_VEL / 2
+					cooldown_right = time.time()
+				elif time.time() - cooldown_left > cooldown and min_left > 0.20:
+					twist.angular.z = MAX_ANG_VEL / 2
+					cooldown_left = time.time()
+
+			#if min_left_diag < 0.25 and min_right > 0.30 and time.time() - cooldown_corner > 2:
+                        #        twist.angular.z = -MAX_ANG_VEL
+                        #        cooldown_corner = time.time()
+
+                        #if min_right_diag < 0.25 and min_left > 0.30 and time.time() - cooldown_corner > 2:
+                        #        twist.angular.z = MAX_ANG_VEL
+                        #        cooldown_corner = time.time()
+
+			turtlebot_moving = True
+				#rospy.loginfo('Distance of the obstacle : %f', min_front)
+
+
+	    	spd_accu += twist.linear.x
+	    	clock_count += 1
+	    	avg_lin_spd = spd_accu / clock_count
+	    	print("Average linear speed: " + str(avg_lin_spd))
+
+	    	self._cmd_pub.publish(twist)
+	    	print(twist.linear.x)
+		time.sleep(0.1)
+def main():
+    rospy.init_node('turtlebot3_obstacle')
+    try:
+        print("going!")
+	obstacle = Obstacle()
+    except rospy.ROSInterruptException:
+        pass
+
+if __name__ == '__main__':
+    starttime = time.time()
+    main()
